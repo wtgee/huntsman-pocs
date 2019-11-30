@@ -1,9 +1,10 @@
 # based upon @jamessynge's astrohave.py code in POCS
 
+import threading
 import time
 
-from pocs.utils import CountdownTimer
 from pocs.dome.abstract_serial_dome import AbstractSerialDome
+from pocs.utils import CountdownTimer
 
 
 class Protocol:
@@ -67,6 +68,7 @@ class HuntsmanDome(AbstractSerialDome):
         self._status = dict()
         self._status_delay = 5  # seconds
         self._status_timer = CountdownTimer(self._status_delay)
+        self._close_event = threading.Event()
 
     @property
     def is_open(self):
@@ -107,12 +109,13 @@ class HuntsmanDome(AbstractSerialDome):
         Boolean
             True if Opened, False if it did not Open.
         """
-        if self.is_open():
+        if self.is_open:
             return True
 
         v = self.status()[Protocol.BATTERY]
         if v < self.MIN_OPERATING_VOLTAGE:
-            self.logger.error('Dome shutter battery voltage too low to open: {!r}', v)
+            self.logger.error(
+                'Dome shutter battery voltage too low to open: {!r}', v)
             return False
 
         self._write_musca(Protocol.OPEN_DOME, 'Opening dome shutter')
@@ -120,9 +123,45 @@ class HuntsmanDome(AbstractSerialDome):
 
         v = self.status()[Protocol.SHUTTER]
         if v == Protocol.OPEN:
+            # refresh the threading close event
+            self._close_event.clear()
+            self.logger.info('Starting thread to keep dome open.')
+            # start a thread to send the keep dome open command to musca
+            keep_open = threading.Thread(target=self.keep_dome_open)
+            keep_open.start()
             return True
         self.logger.warning('HuntsmanDome.open wrong final state: {!r}', v)
         return False
+
+    def keep_dome_open(self):
+        """Periodically tell musca to reset watchdog timer
+
+        """
+        last_time = time.monotonic()
+        # maximum shutter open time in seconds
+        max_open_seconds = 15 * 60 * 60  # 15 hours in seconds
+        for i in range(max_open_seconds):
+            # check to see if a dome closure has occured
+            if self._close_event.is_set():
+                self.logger.info(
+                    'Keep dome open thread has detected a dome closure, ending thread.')
+                # if dome has closed, don't try to 'keep dome open'
+                return
+            now = time.monotonic()
+            if now - last_time > 290:
+                status = self._get_shutter_status_dict()
+                self.logger.info((f'Status Update: Shutter is '
+                                  f'{status[Protocol.SHUTTER]}, '
+                                  f'Door is {status[Protocol.DOOR]}, '
+                                  f'Battery voltage is {status[Protocol.BATTERY]}'))
+                self._write_musca(Protocol.KEEP_DOME_OPEN,
+                                  'Keeping dome open.')
+                last_time = now
+                self.logger.debug(
+                    'Keep dome open thread sleeping for ~5 minutes.')
+            time.sleep(1)
+        self.logger.warning(
+            'Maximum keep dome open loops exceeded. Dome will close in 5 minutes.')
 
     def close(self):
         """Close the shutter using musca.
@@ -132,14 +171,15 @@ class HuntsmanDome(AbstractSerialDome):
         Boolean
             True if Closed, False if it did not Close.
         """
-        if self.is_closed():
+        if self.is_closed:
             return True
 
+        self._close_event.set()
         self._write_musca(Protocol.CLOSE_DOME, 'Closing dome shutter')
         time.sleep(HuntsmanDome.MOVE_TIMEOUT)
 
         v = self.status()[Protocol.SHUTTER]
-        if v == Protocol.CLOSE:
+        if v == Protocol.CLOSED:
             return True
         self.logger.warning('HuntsmanDome.open wrong final state: {!r}', v)
         return False
@@ -149,6 +189,8 @@ class HuntsmanDome(AbstractSerialDome):
             return self._get_shutter_status_string()
         return 'Disconnected'
 
+    def __del__(self):
+        self.close()
 
 ###############################################################################
 # Private Methods
