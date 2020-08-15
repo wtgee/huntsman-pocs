@@ -181,10 +181,10 @@ def test_default_lookup_trigger(pocs):
 
 
 def test_free_space(pocs):
-    assert pocs.has_free_space() is True
+    assert pocs.has_free_space()
 
     # Test something ridiculous
-    assert pocs.has_free_space(required_space=1e9 * u.gigabyte) is False
+    assert not pocs.has_free_space(required_space=1e9 * u.gigabyte)
 
 
 def test_is_dark_simulator(pocs):
@@ -233,6 +233,49 @@ def test_is_weather_safe_no_simulator(pocs, db):
     assert pocs.is_weather_safe() is False
 
 
+def test_darks_collection_simulator(pocs, tmpdir):
+    """Test routines to take darks using the same structure of the
+       taking_darks state."""
+    pocs.config['simulator'] = hardware.get_all_names()
+    pocs._do_states = True
+    pocs.observatory.scheduler.clear_available_observations()
+
+    pocs.observatory.scheduler.fields_list.append({'name': 'KIC 8462852-1',
+                                                   'position': '20h06m15.4536s +44d27m24.75s',
+                                                   'priority': '100',
+                                                   'exptime': 100.0,
+                                                   'min_nexp': 1,
+                                                   'exp_set_size': 1,
+                                                   })
+
+    pocs.state = 'parked'
+
+    pocs.initialize()
+    assert(pocs.is_initialized is True)
+
+    exptimes_list = list()
+    for target in pocs.observatory.scheduler.fields_list:
+        exptime = target['exptime']
+        if exptime not in exptimes_list:
+            exptimes_list.append(exptime)
+
+    if len(exptimes_list) > 0:
+        pocs.logger.info("I'm starting with dark-field exposures")
+        ndarks_per_exp = 2
+        darks = pocs.observatory.take_dark_fields(exptimes_list,
+                                                  n_darks=ndarks_per_exp)
+        expected_number_of_darks = (len(pocs.observatory.cameras.keys())
+                                    * ndarks_per_exp * len(exptimes_list))
+
+        for filename in darks:
+            assert(os.path.basename(filename).endswith('fits') is True)
+
+        assert(len(darks) == expected_number_of_darks)
+
+    else:
+        pytest.fail(pocs.logger.info('No exposure times were provided'))
+
+
 def test_pyro_camera(config, camera_server):
     conf = config.copy()
     conf['cameras'] = {'distributed_cameras': True}
@@ -265,15 +308,15 @@ def test_run_wait_until_safe(observatory, cmd_publisher, msg_subscriber):
         pocs.observatory.scheduler.add_observation({'name': 'KIC 8462852',
                                                     'position': '20h06m15.4536s +44d27m24.75s',
                                                     'priority': '100',
-                                                    'exp_time': 2,
+                                                    'exptime': 2,
                                                     'min_nexp': 2,
                                                     'exp_set_size': 2,
                                                     })
 
         pocs.initialize()
-        pocs.logger.info('Starting observatory run')
+        observatory.logger.info('Starting observatory run')
         assert pocs.is_weather_safe() is False
-        pocs.logger.info('Sending RUNNING message')
+        observatory.logger.info('Sending RUNNING message')
         pocs.send_message('RUNNING')
         pocs.run(run_once=True, exit_when_done=True)
         assert pocs.observatory.is_weather_safe() is True
@@ -288,7 +331,9 @@ def test_run_wait_until_safe(observatory, cmd_publisher, msg_subscriber):
         assert wait_for_running(msg_subscriber)
         observatory.logger.info('Got RUNNING message')
 
+        # Give us time to get into the observing state.
         time.sleep(5)
+
         # Insert a dummy weather record to break wait
         observatory.db.insert_current('weather', {'safe': True})
 
@@ -344,8 +389,8 @@ def test_run_no_targets_and_exit(pocs):
     pocs.observatory.scheduler._fields_list = None
     assert pocs.is_initialized is True
 
-    pocs.observatory.take_flat_fields = False
-    assert pocs.observatory.take_flat_fields is False
+    pocs.observatory.flat_fields_required = False
+    assert pocs.observatory.flat_fields_required is False
     pocs.run(exit_when_done=True, run_once=True)
     assert pocs.state == 'sleeping'
 
@@ -360,7 +405,7 @@ def test_run(pocs):
     pocs.observatory.scheduler.add_observation({'name': 'KIC 8462852',
                                                         'position': '20h06m15.4536s +44d27m24.75s',
                                                         'priority': '1000',
-                                                        'exp_time': 2,
+                                                        'exptime': 2,
                                                         'min_nexp': 2,
                                                         'exp_set_size': 2,
                                                 })
@@ -368,7 +413,7 @@ def test_run(pocs):
     pocs.initialize()
     assert pocs.is_initialized is True
 
-    pocs.observatory.take_flat_fields = False
+    pocs.observatory.flat_fields_required = False
     pocs.run(exit_when_done=True, run_once=True)
     assert pocs.state == 'sleeping'
 
@@ -380,7 +425,7 @@ def test_run_power_down_interrupt(observatory, msg_subscriber, cmd_publisher):
         pocs.observatory.scheduler.fields_list = [{'name': 'KIC 8462852',
                                                    'position': '20h06m15.4536s +44d27m24.75s',
                                                    'priority': '100',
-                                                   'exp_time': 2,
+                                                   'exptime': 2,
                                                    'min_nexp': 1,
                                                    'exp_set_size': 1,
                                                    }]

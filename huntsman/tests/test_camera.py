@@ -9,8 +9,10 @@ import os
 import time
 import glob
 import sys
+import shutil
 
 import astropy.units as u
+from astropy.io import fits
 
 import Pyro4
 import Pyro4.util
@@ -27,38 +29,36 @@ sys.excepthook = Pyro4.util.excepthook
 params = [PyroCamera]
 ids = ['pyro']
 
-
-@pytest.fixture(scope='module')
-def images_dir(tmpdir_factory):
-    directory = tmpdir_factory.mktemp('images')
-    return str(directory)
-
-
 # Ugly hack to access id inside fixture
+
+
 @pytest.fixture(scope='module', params=zip(params, ids), ids=ids)
-def camera(request, images_dir, camera_server):
+def camera(request, images_dir_control, camera_server):
     if request.param[0] == PyroCamera:
         ns = Pyro4.locateNS()
         cameras = ns.list(metadata_all={'POCS', 'Camera'})
         cam_name, cam_uri = cameras.popitem()
         camera = PyroCamera(port=cam_name, uri=cam_uri)
 
-    camera.config['directories']['images'] = images_dir
+    # This is a client-side pyro.Camera instance.
+    # Currently it does not get its config from the config server.
+    camera.config['directories']['images'] = images_dir_control
+
     return camera
 
 
 @pytest.fixture(scope='module')
-def counter(camera):
-    return {'value': 0}
+def patterns(camera, images_dir_device):
 
+    # It would be better to replace images_dir_device by images_dir_control.
+    # However, problems with rmtree and SSHFS causes the autofocus code to hang.
 
-@pytest.fixture(scope='module')
-def patterns(camera, images_dir):
-    patterns = {'final': os.path.join(images_dir, 'focus', camera.uid, '*',
+    patterns = {'base': os.path.join(images_dir_device, 'focus', camera.uid),
+                'final': os.path.join(images_dir_device, 'focus', camera.uid, '*',
                                       ('*_final.' + camera.file_extension)),
-                'fine_plot': os.path.join(images_dir, 'focus', camera.uid, '*',
+                'fine_plot': os.path.join(images_dir_device, 'focus', camera.uid, '*',
                                           'fine_focus.png'),
-                'coarse_plot': os.path.join(images_dir, 'focus', camera.uid, '*',
+                'coarse_plot': os.path.join(images_dir_device, 'focus', camera.uid, '*',
                                             'coarse_focus.png')}
     return patterns
 
@@ -86,13 +86,13 @@ def test_get_temp(camera):
 
 def test_is_cooled(camera):
     cooled_camera = camera.is_cooled_camera
-    assert cooled_camera is not None
+    assert cooled_camera in {True, False}
 
 
 def test_set_target_temperature(camera):
     if camera.is_cooled_camera:
-        camera._target_temperature = 10 * u.Celsius
-        assert abs(camera._target_temperature - 10 * u.Celsius) < 0.5 * u.Celsius
+        camera.target_temperature = 10 * u.Celsius
+        assert abs(camera.target_temperature - 10 * u.Celsius) < 0.5 * u.Celsius
     else:
         pytest.skip("Camera {} doesn't implement temperature control".format(camera.name))
 
@@ -301,77 +301,107 @@ def test_exposure_timeout(camera, tmpdir, caplog):
     time.sleep(5)
 
 
-def test_observation(camera, images_dir):
+def test_observation(camera, images_dir_control):
     """
     Tests functionality of take_observation()
     """
     field = Field('Test Observation', '20h00m43.7135s +22d42m39.0645s')
-    observation = Observation(field, exptime=1.5 * u.second)
+    observation = Observation(field, exptime=1.5 * u.second, filter_name='deux')
     observation.seq_time = '19991231T235959'
     camera.take_observation(observation, headers={})
     time.sleep(7)
-    observation_pattern = os.path.join(images_dir, 'fields', 'TestObservation',
+    observation_pattern = os.path.join(images_dir_control, 'fields', 'TestObservation',
                                        camera.uid, observation.seq_time, '*.fits*')
     assert len(glob.glob(observation_pattern)) == 1
+    for _ in glob.glob(observation_pattern):
+        os.remove(_)
 
 
-def test_autofocus_coarse(camera, patterns, counter):
+def test_observation_nofilter(camera, images_dir_control):
+    """
+    Tests functionality of take_observation()
+    """
+    field = Field('Test Observation', '20h00m43.7135s +22d42m39.0645s')
+    observation = Observation(field, exptime=1.5 * u.second, filter_name=None)
+    observation.seq_time = '19991231T235959'
+    camera.take_observation(observation, headers={})
+    time.sleep(7)
+    observation_pattern = os.path.join(images_dir_control, 'fields', 'TestObservation',
+                                       camera.uid, observation.seq_time, '*.fits*')
+    assert len(glob.glob(observation_pattern)) == 1
+    for _ in glob.glob(observation_pattern):
+        os.remove(_)
+
+
+def test_autofocus_coarse(camera, patterns):
     if not camera.focuser:
         pytest.skip("Camera does not have a focuser")
-    autofocus_event = camera.autofocus(coarse=True)
-    autofocus_event.wait()
-    counter['value'] += 1
-    assert len(glob.glob(patterns['final'])) == counter['value']
+    try:
+        autofocus_event = camera.autofocus(coarse=True)
+        autofocus_event.wait()
+        assert len(glob.glob(patterns['final'])) == 1
+    finally:
+        shutil.rmtree(patterns['base'])
 
 
-def test_autofocus_fine(camera, patterns, counter):
+def test_autofocus_fine(camera, patterns):
     if not camera.focuser:
         pytest.skip("Camera does not have a focuser")
-    autofocus_event = camera.autofocus()
-    autofocus_event.wait()
-    counter['value'] += 1
-    assert len(glob.glob(patterns['final'])) == counter['value']
+    try:
+        autofocus_event = camera.autofocus()
+        autofocus_event.wait()
+        assert len(glob.glob(patterns['final'])) == 1
+    finally:
+        shutil.rmtree(patterns['base'])
 
 
-def test_autofocus_fine_blocking(camera, patterns, counter):
+def test_autofocus_fine_blocking(camera, patterns):
     if not camera.focuser:
         pytest.skip("Camera does not have a focuser")
-    autofocus_event = camera.autofocus(blocking=True)
-    assert autofocus_event.is_set()
-    counter['value'] += 1
-    assert len(glob.glob(patterns['final'])) == counter['value']
+    try:
+        autofocus_event = camera.autofocus(blocking=True)
+        assert autofocus_event.is_set()
+        assert len(glob.glob(patterns['final'])) == 1
+    finally:
+        shutil.rmtree(patterns['base'])
 
 
-def test_autofocus_with_plots(camera, patterns, counter):
+def test_autofocus_with_plots(camera, patterns):
     if not camera.focuser:
         pytest.skip("Camera does not have a focuser")
-    autofocus_event = camera.autofocus(make_plots=True)
-    autofocus_event.wait()
-    counter['value'] += 1
-    assert len(glob.glob(patterns['final'])) == counter['value']
-    assert len(glob.glob(patterns['fine_plot'])) == 1
+    try:
+        autofocus_event = camera.autofocus(make_plots=True)
+        autofocus_event.wait()
+        assert len(glob.glob(patterns['final'])) == 1
+        assert len(glob.glob(patterns['fine_plot'])) == 1
+    finally:
+        shutil.rmtree(patterns['base'])
 
 
-def test_autofocus_coarse_with_plots(camera, patterns, counter):
+def test_autofocus_coarse_with_plots(camera, patterns):
     if not camera.focuser:
         pytest.skip("Camera does not have a focuser")
-    autofocus_event = camera.autofocus(coarse=True, make_plots=True)
-    autofocus_event.wait()
-    counter['value'] += 1
-    assert len(glob.glob(patterns['final'])) == counter['value']
-    assert len(glob.glob(patterns['coarse_plot'])) == 1
+    try:
+        autofocus_event = camera.autofocus(coarse=True, make_plots=True)
+        autofocus_event.wait()
+        assert len(glob.glob(patterns['final'])) == 1
+        assert len(glob.glob(patterns['coarse_plot'])) == 1
+    finally:
+        shutil.rmtree(patterns['base'])
 
 
-def test_autofocus_keep_files(camera, patterns, counter):
+def test_autofocus_keep_files(camera, patterns):
     if not camera.focuser:
         pytest.skip("Camera does not have a focuser")
-    autofocus_event = camera.autofocus(keep_files=True)
-    autofocus_event.wait()
-    counter['value'] += 1
-    assert len(glob.glob(patterns['final'])) == counter['value']
+    try:
+        autofocus_event = camera.autofocus(keep_files=True)
+        autofocus_event.wait()
+        assert len(glob.glob(patterns['final'])) == 1
+    finally:
+        shutil.rmtree(patterns['base'])
 
 
-def test_autofocus_no_size(camera, caplog):
+def test_autofocus_no_size(camera):
     try:
         initial_focus = camera.focuser.position
     except AttributeError:
@@ -379,16 +409,13 @@ def test_autofocus_no_size(camera, caplog):
     initial_focus = camera.focuser.position
     thumbnail_size = camera.focuser.autofocus_size
     camera.focuser.autofocus_size = None
-    camera.autofocus()
-    # Will be an ValueError raised, but it's hidden in another thread.
-    # Should be an error in the logs, though.
-    time.sleep(0.1)
-    assert caplog.records[-1].levelname == "ERROR"
+    with pytest.raises(ValueError):
+        camera.autofocus()
     camera.focuser.autofocus_size = thumbnail_size
     assert camera.focuser.position == initial_focus
 
 
-def test_autofocus_no_seconds(camera, caplog):
+def test_autofocus_no_seconds(camera):
     try:
         initial_focus = camera.focuser.position
     except AttributeError:
@@ -396,16 +423,13 @@ def test_autofocus_no_seconds(camera, caplog):
     initial_focus = camera.focuser.position
     seconds = camera.focuser.autofocus_seconds
     camera.focuser.autofocus_seconds = None
-    camera.autofocus()
-    # Will be an ValueError raise, but it's hidden in another thread.
-    # Should be an error in the logs, though.
-    time.sleep(0.1)
-    assert caplog.records[-1].levelname == "ERROR"
+    with pytest.raises(ValueError):
+        camera.autofocus()
     camera.focuser.autofocus_seconds = seconds
     assert camera.focuser.position == initial_focus
 
 
-def test_autofocus_no_step(camera, caplog):
+def test_autofocus_no_step(camera):
     try:
         initial_focus = camera.focuser.position
     except AttributeError:
@@ -413,16 +437,13 @@ def test_autofocus_no_step(camera, caplog):
     initial_focus = camera.focuser.position
     autofocus_step = camera.focuser.autofocus_step
     camera.focuser.autofocus_step = None
-    camera.autofocus()
-    # Will be an ValueError raise, but it's hidden in another thread.
-    # Should be an error in the logs, though.
-    time.sleep(0.1)
-    assert caplog.records[-1].levelname == "ERROR"
+    with pytest.raises(ValueError):
+        camera.autofocus()
     camera.focuser.autofocus_step = autofocus_step
     assert camera.focuser.position == initial_focus
 
 
-def test_autofocus_no_range(camera, caplog):
+def test_autofocus_no_range(camera):
     try:
         initial_focus = camera.focuser.position
     except AttributeError:
@@ -430,11 +451,8 @@ def test_autofocus_no_range(camera, caplog):
     initial_focus = camera.focuser.position
     autofocus_range = camera.focuser.autofocus_range
     camera.focuser.autofocus_range = None
-    camera.autofocus()
-    # Will be an ValueError raise, but it's hidden in another thread.
-    # Should be an error in the logs, though.
-    time.sleep(0.1)
-    assert caplog.records[-1].levelname == "ERROR"
+    with pytest.raises(ValueError):
+        camera.autofocus()
     camera.focuser.autofocus_range = autofocus_range
     assert camera.focuser.position == initial_focus
 
@@ -445,10 +463,10 @@ def test_autofocus_camera_disconnected(camera):
     except AttributeError:
         pytest.skip("Camera does not have an exposed focuser attribute")
     initial_focus = camera.focuser.position
-    camera._connected = False
+    camera._proxy.set("_connected",  False)
     with pytest.raises(AssertionError):
         camera.autofocus()
-    camera._connected = True
+    camera._proxy.set("_connected", True)
     assert camera.focuser.position == initial_focus
 
 
@@ -458,10 +476,10 @@ def test_autofocus_focuser_disconnected(camera):
     except AttributeError:
         pytest.skip("Camera does not have an exposed focuser attribute")
     initial_focus = camera.focuser.position
-    camera.focuser._connected = False
+    camera._proxy.set("_connected", False, subcomponent="focuser")
     with pytest.raises(AssertionError):
         camera.autofocus()
-    camera.focuser._connected = True
+    camera._proxy.set("_connected", True, subcomponent="focuser")
     assert camera.focuser.position == initial_focus
 
 
